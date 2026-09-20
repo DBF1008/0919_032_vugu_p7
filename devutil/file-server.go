@@ -9,7 +9,11 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/text/collate"
+	"golang.org/x/text/language"
 )
 
 // FileServer is similar to http.FileServer but has some options and behavior differences more useful for Vugu programs.
@@ -31,6 +35,15 @@ type FileServer struct {
 	fsys            http.FileSystem
 	listings        bool         // do we show directory listings
 	notFoundHandler http.Handler // call when not found
+
+	// listingLang is the locale used to sort directory listings.
+	// The zero value means the locale is determined from the LC_ALL,
+	// LC_COLLATE and LANG environment variables, falling back to the
+	// root collation order (Unicode code points).
+	listingLang language.Tag
+
+	listingCollOnce sync.Once
+	listingColl     *collate.Collator
 }
 
 // NewFileServer returns a FileServer instance.
@@ -118,12 +131,19 @@ func (fs *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f, err := fs.fsys.Open(name)
 	if err != nil {
 
-		// try again with .html
-		f2, err2 := fs.fsys.Open(name + ".html")
-		if err2 == nil {
-			f = f2
-		} else {
-
+		// Try again with .html appended, but only when the request is
+		// plain path-based. A query string or an escaped "?" inside the
+		// path indicates a dynamic request (e.g. /api/getUser?name=foo):
+		// appending .html can never match a file and would just waste a
+		// filesystem lookup on the way to the not-found handler.
+		if fs.canAppendHTML(r, name) {
+			f2, err2 := fs.fsys.Open(name + ".html")
+			if err2 == nil {
+				f = f2
+				err = nil
+			}
+		}
+		if err != nil {
 			msg, code := toHTTPError(err)
 			if code == 404 {
 				fs.serveNotFound(w, r)
@@ -193,7 +213,7 @@ func (fs *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		setLastModified(w, d.ModTime())
-		dirList(w, r, f)
+		fs.dirList(w, r, f)
 		return
 	}
 
@@ -209,11 +229,28 @@ func (fs *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // localRedirect gives a Moved Permanently response.
 // It does not convert relative paths to absolute paths like Redirect does.
 func localRedirect(w http.ResponseWriter, r *http.Request, newPath string) {
+	// The target may contain special characters (e.g. names containing
+	// "?", "#" or spaces) that must be percent-encoded, otherwise the
+	// browser would interpret them as the query string or fragment and
+	// redirect to the wrong location.
+	locURL := url.URL{Path: newPath}
+	newPath = locURL.String()
 	if q := r.URL.RawQuery; q != "" {
 		newPath += "?" + q
 	}
 	w.Header().Set("Location", newPath)
 	w.WriteHeader(http.StatusMovedPermanently)
+}
+
+// canAppendHTML reports whether it is worth retrying the request by
+// appending the .html suffix. Requests carrying a query string, or
+// whose decoded path contains a "?" or "#", do not address a static
+// file and must skip the redundant lookup.
+func (fs *FileServer) canAppendHTML(r *http.Request, name string) bool {
+	if r.URL.RawQuery != "" {
+		return false
+	}
+	return !strings.ContainsAny(name, "?#")
 }
 
 // toHTTPError returns a non-specific HTTP error message and status code
@@ -291,14 +328,20 @@ func isZeroTime(t time.Time) bool {
 	return t.IsZero() || t.Equal(unixEpochTime)
 }
 
-func dirList(w http.ResponseWriter, r *http.Request, f http.File) {
+func (fs *FileServer) dirList(w http.ResponseWriter, r *http.Request, f http.File) {
 	dirs, err := f.Readdir(-1)
 	if err != nil {
 		log.Print(r, "http: error reading directory: %v", err)
 		http.Error(w, "Error reading directory", http.StatusInternalServerError)
 		return
 	}
-	sort.Slice(dirs, func(i, j int) bool { return dirs[i].Name() < dirs[j].Name() })
+	coll := fs.listingCollator()
+	sort.Slice(dirs, func(i, j int) bool {
+		if coll != nil {
+			return coll.CompareString(dirs[i].Name(), dirs[j].Name()) < 0
+		}
+		return dirs[i].Name() < dirs[j].Name()
+	})
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, "<pre>\n")
@@ -314,6 +357,51 @@ func dirList(w http.ResponseWriter, r *http.Request, f http.File) {
 		fmt.Fprintf(w, "<a href=\"%s\">%s</a>\n", url.String(), htmlReplacer.Replace(name))
 	}
 	fmt.Fprintf(w, "</pre>\n")
+}
+
+// listingCollator returns the collator used to order directory listings.
+// It is lazily created from the FileServer's configured locale or, by
+// default, the locale advertised by the LC_ALL, LC_COLLATE and LANG
+// environment variables. A nil collator means plain code-point ordering
+// should be used.
+func (fs *FileServer) listingCollator() *collate.Collator {
+	fs.listingCollOnce.Do(func() {
+		tag := fs.listingLang
+		if tag == language.Und {
+			tag = localeFromEnv()
+		}
+		if tag != language.Und {
+			fs.listingColl = collate.New(tag)
+		}
+	})
+	return fs.listingColl
+}
+
+// localeFromEnv determines the preferred sorting locale from the
+// LC_ALL, LC_COLLATE and LANG environment variables, in that order.
+// language.Und is returned when no usable locale is configured
+// (including the "C" and "POSIX" locales).
+func localeFromEnv() language.Tag {
+	for _, key := range []string{"LC_ALL", "LC_COLLATE", "LANG"} {
+		raw := strings.TrimSpace(os.Getenv(key))
+		if raw == "" || raw == "C" || raw == "POSIX" {
+			continue
+		}
+		// Strip charset (".UTF-8") and modifier (".@cjknarrow") parts.
+		if i := strings.IndexAny(raw, ".@"); i >= 0 {
+			raw = raw[:i]
+		}
+		if raw == "" {
+			continue
+		}
+		// Unix locale identifiers use underscores (e.g. "zh_CN"),
+		// BCP 47 language tags use hyphens.
+		tag := language.Make(strings.ReplaceAll(raw, "_", "-"))
+		if tag != language.Und {
+			return tag
+		}
+	}
+	return language.Und
 }
 
 var htmlReplacer = strings.NewReplacer(
