@@ -10,6 +10,9 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"golang.org/x/text/collate"
+	"golang.org/x/text/language"
 )
 
 // FileServer is similar to http.FileServer but has some options and behavior differences more useful for Vugu programs.
@@ -103,6 +106,17 @@ func (fs *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.URL.Path = upath
 	}
 
+	// Defensively strip any query string or fragment embedded in the path
+	// (e.g. non-standard request URLs like "/api/getUser?name=foo"), so it
+	// is never treated as part of the file name. In particular this avoids
+	// the ".html" retry below looking up a bogus name such as
+	// "/api/getUser?name=foo.html", which wastes a file lookup before
+	// falling through to the not-found handler anyway.
+	if i := strings.IndexAny(upath, "?#"); i >= 0 {
+		upath = upath[:i]
+		r.URL.Path = upath
+	}
+
 	const indexPage = "/index.html"
 
 	// redirect .../index.html to .../
@@ -148,12 +162,12 @@ func (fs *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	url := r.URL.Path
 	if d.IsDir() {
 		if url[len(url)-1] != '/' {
-			localRedirect(w, r, path.Base(url)+"/")
+			localRedirect(w, r, escapedPathBase(url)+"/")
 			return
 		}
 	} else {
 		if url[len(url)-1] == '/' {
-			localRedirect(w, r, "../"+path.Base(url))
+			localRedirect(w, r, "../"+escapedPathBase(url))
 			return
 		}
 	}
@@ -163,7 +177,7 @@ func (fs *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		url := r.URL.Path
 		// redirect if the directory name doesn't end in a slash
 		if url == "" || url[len(url)-1] != '/' {
-			localRedirect(w, r, path.Base(url)+"/")
+			localRedirect(w, r, escapedPathBase(url)+"/")
 			return
 		}
 
@@ -214,6 +228,14 @@ func localRedirect(w http.ResponseWriter, r *http.Request, newPath string) {
 	}
 	w.Header().Set("Location", newPath)
 	w.WriteHeader(http.StatusMovedPermanently)
+}
+
+// escapedPathBase returns the final path segment of p, percent-escaped so it
+// is safe to use as a relative redirect target. Without escaping, directory
+// or file names containing special characters (spaces, '%', '?', '#',
+// non-ASCII bytes, etc.) would corrupt the redirect Location.
+func escapedPathBase(p string) string {
+	return (&url.URL{Path: path.Base(p)}).String()
 }
 
 // toHTTPError returns a non-specific HTTP error message and status code
@@ -298,7 +320,14 @@ func dirList(w http.ResponseWriter, r *http.Request, f http.File) {
 		http.Error(w, "Error reading directory", http.StatusInternalServerError)
 		return
 	}
-	sort.Slice(dirs, func(i, j int) bool { return dirs[i].Name() < dirs[j].Name() })
+	// Sort locale-aware (e.g. Chinese names ordered by pinyin) rather than by
+	// raw byte order, and compare case-insensitively and numerically so file
+	// names read naturally. A Collator is not safe for concurrent use, so a
+	// new one is created for each listing.
+	collator := collate.New(language.SimplifiedChinese, collate.IgnoreCase, collate.Numeric)
+	sort.Slice(dirs, func(i, j int) bool {
+		return collator.CompareString(dirs[i].Name(), dirs[j].Name()) < 0
+	})
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, "<pre>\n")

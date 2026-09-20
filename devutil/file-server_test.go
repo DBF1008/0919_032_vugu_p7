@@ -5,8 +5,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -99,6 +101,117 @@ func TestFileServer(t *testing.T) {
 	fs.ServeHTTP(wr, r)
 	checkStatus(t, r, wr.Result(), 403)
 	checkBody(t, r, wr.Result(), "some other response here")
+
+}
+
+// recordingFS wraps an http.FileSystem and records every name passed to Open.
+type recordingFS struct {
+	fsys  http.FileSystem
+	opens []string
+}
+
+func (r *recordingFS) Open(name string) (http.File, error) {
+	r.opens = append(r.opens, name)
+	return r.fsys.Open(name)
+}
+
+func TestFileServerQueryString(t *testing.T) {
+
+	tmpDir, err := os.MkdirTemp("", "TestFileServerQueryString")
+	must(err)
+	defer os.RemoveAll(tmpDir)
+	t.Logf("Using temporary dir: %s", tmpDir)
+
+	rec := &recordingFS{fsys: http.Dir(tmpDir)}
+	fs := NewFileServer().SetFileSystem(rec)
+
+	// a normal request with a query string should still serve a.html
+	must(os.WriteFile(filepath.Join(tmpDir, "a.html"), []byte(`<html><body>a page here</body></html>`), 0644))
+	wr := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/a?name=foo", nil)
+	fs.ServeHTTP(wr, r)
+	checkStatus(t, r, wr.Result(), 200)
+	checkBody(t, r, wr.Result(), "a page here")
+
+	// a non-standard request with the query string embedded in the path
+	// (e.g. "/api/getUser?name=foo") must not result in a file lookup for
+	// the bogus name "/api/getUser?name=foo.html"
+	rec.opens = nil
+	wr = httptest.NewRecorder()
+	r = httptest.NewRequest("GET", "/api/getUser", nil)
+	r.URL.Path = "/api/getUser?name=foo" // simulate query string left in path
+	r.URL.RawQuery = ""
+	fs.ServeHTTP(wr, r)
+	checkStatus(t, r, wr.Result(), 404)
+	for _, name := range rec.opens {
+		if strings.ContainsAny(name, "?#") {
+			t.Errorf("expected no file lookup containing query string or fragment, but Open was called with %q (all opens: %v)", name, rec.opens)
+		}
+	}
+
+}
+
+func TestFileServerRedirectEscaping(t *testing.T) {
+
+	tmpDir, err := os.MkdirTemp("", "TestFileServerRedirectEscaping")
+	must(err)
+	defer os.RemoveAll(tmpDir)
+	t.Logf("Using temporary dir: %s", tmpDir)
+
+	fs := NewFileServer().SetDir(tmpDir)
+
+	// directory names containing special characters must be percent-escaped
+	// in the redirect Location so it is not corrupted
+	for dir, location := range map[string]string{
+		"my dir": "my%20dir/",
+		"中文目录":   "%E4%B8%AD%E6%96%87%E7%9B%AE%E5%BD%95/",
+		"100%":   "100%25/",
+	} {
+		must(os.Mkdir(filepath.Join(tmpDir, dir), 0755))
+		wr := httptest.NewRecorder()
+		// build the request target the same way a client would: with the
+		// path percent-escaped
+		r := httptest.NewRequest("GET", (&url.URL{Path: "/" + dir}).String(), nil)
+		fs.ServeHTTP(wr, r)
+		checkStatus(t, r, wr.Result(), 301)
+		checkHeader(t, r, wr.Result(), "Location", location)
+	}
+
+}
+
+func TestFileServerDirListLocaleSort(t *testing.T) {
+
+	tmpDir, err := os.MkdirTemp("", "TestFileServerDirListLocaleSort")
+	must(err)
+	defer os.RemoveAll(tmpDir)
+	t.Logf("Using temporary dir: %s", tmpDir)
+
+	fs := NewFileServer().SetDir(tmpDir).SetListings(true)
+
+	// Chinese file names should be sorted locale-aware (by pinyin), not by
+	// raw byte order: pinyin order is beijing < guangzhou < shanghai,
+	// whereas byte order would put 上海 (U+4E0A) first
+	names := []string{"apple.txt", "北京.txt", "广州.txt", "上海.txt"}
+	for _, name := range names {
+		must(os.WriteFile(filepath.Join(tmpDir, name), []byte("x"), 0644))
+	}
+	wr := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/", nil)
+	fs.ServeHTTP(wr, r)
+	checkStatus(t, r, wr.Result(), 200)
+	body := wr.Body.String()
+	prev := -1
+	for _, name := range names {
+		i := strings.Index(body, name)
+		if i < 0 {
+			t.Errorf("expected listing to contain %q, body: %s", name, body)
+			continue
+		}
+		if i < prev {
+			t.Errorf("expected %q to appear after previous entries in listing, body: %s", name, body)
+		}
+		prev = i
+	}
 
 }
 
